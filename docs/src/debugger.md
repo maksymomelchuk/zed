@@ -17,6 +17,7 @@ To debug code written in a specific language, Zed needs to find a debug adapter 
 - [C](./languages/c.md#debugging) (built-in)
 - [C++](./languages/cpp.md#debugging) (built-in)
 - [Go](./languages/go.md#debugging) (built-in)
+- [Java](./languages/java.md#debugging) (provided by extension)
 - [JavaScript](./languages/javascript.md#debugging) (built-in)
 - [PHP](./languages/php.md#debugging) (built-in)
 - [Python](./languages/python.md#debugging) (built-in)
@@ -197,7 +198,7 @@ The settings for the debugger are grouped under the `debugger` key in `settings.
 
 1. Statement - The step should allow the program to run until the current statement has finished executing.
    The meaning of a statement is determined by the adapter and it may be considered equivalent to a line.
-   For example 'for(int i = 0; i < 10; i++)' could be considered to have 3 statements 'int i = 0', 'i < 10', and 'i++'.
+   For example `for(int i = 0; i < 10; i++)` could be considered to have 3 statements `int i = 0`, `i < 10`, and `i++`.
 
 ```json [settings]
 {

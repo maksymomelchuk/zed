@@ -22,7 +22,7 @@ use sea_orm::{
     entity::prelude::*,
     sea_query::{Alias, Expr, OnConflict},
 };
-use semantic_version::SemanticVersion;
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::ops::RangeInclusive;
 use std::{
@@ -41,7 +41,6 @@ use worktree_settings_file::LocalSettingsKind;
 pub use tests::TestDb;
 
 pub use ids::*;
-pub use queries::contributors::ContributorSelector;
 pub use sea_orm::ConnectOptions;
 pub use tables::user::Model as User;
 pub use tables::*;
@@ -385,9 +384,6 @@ pub struct NewUserParams {
 #[derive(Debug)]
 pub struct NewUserResult {
     pub user_id: UserId,
-    pub metrics_id: String,
-    pub inviting_user_id: Option<UserId>,
-    pub signup_device_id: Option<String>,
 }
 
 /// The result of updating a channel membership.
@@ -671,7 +667,7 @@ pub struct NewExtensionVersion {
 
 pub struct ExtensionVersionConstraints {
     pub schema_versions: RangeInclusive<i32>,
-    pub wasm_api_versions: RangeInclusive<SemanticVersion>,
+    pub wasm_api_versions: RangeInclusive<semver::Version>,
 }
 
 impl LocalSettingsKind {

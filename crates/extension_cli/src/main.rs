@@ -71,6 +71,7 @@ async fn main() -> Result<()> {
             &extension_path,
             &mut manifest,
             CompileExtensionOptions { release: true },
+            fs.clone(),
         )
         .await
         .context("failed to compile extension")?;
@@ -143,6 +144,10 @@ fn extension_provides(manifest: &ExtensionManifest) -> BTreeSet<ExtensionProvide
 
     if !manifest.context_servers.is_empty() {
         provides.insert(ExtensionProvides::ContextServers);
+    }
+
+    if !manifest.agent_servers.is_empty() {
+        provides.insert(ExtensionProvides::AgentServers);
     }
 
     if manifest.snippets.is_some() {

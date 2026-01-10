@@ -1,7 +1,7 @@
 use crate::acp::AcpThreadView;
-use crate::{AgentPanel, RemoveSelectedThread};
-use agent::{HistoryEntry, HistoryStore};
-use chrono::{Datelike as _, Local, NaiveDate, TimeDelta};
+use crate::{AgentPanel, RemoveHistory, RemoveSelectedThread};
+use agent::{DbThreadMetadata, ThreadStore};
+use chrono::{Datelike as _, Local, NaiveDate, TimeDelta, Utc};
 use editor::{Editor, EditorEvent};
 use fuzzy::StringMatchCandidate;
 use gpui::{
@@ -12,12 +12,22 @@ use std::{fmt::Display, ops::Range};
 use text::Bias;
 use time::{OffsetDateTime, UtcOffset};
 use ui::{
-    HighlightedLabel, IconButtonShape, ListItem, ListItemSpacing, Tooltip, WithScrollbar,
-    prelude::*,
+    ElementId, HighlightedLabel, IconButtonShape, ListItem, ListItemSpacing, Tab, Tooltip,
+    WithScrollbar, prelude::*,
 };
 
+const DEFAULT_TITLE: &SharedString = &SharedString::new_static("New Thread");
+
+fn thread_title(entry: &DbThreadMetadata) -> &SharedString {
+    if entry.title.is_empty() {
+        DEFAULT_TITLE
+    } else {
+        &entry.title
+    }
+}
+
 pub struct AcpThreadHistory {
-    pub(crate) history_store: Entity<HistoryStore>,
+    pub(crate) thread_store: Entity<ThreadStore>,
     scroll_handle: UniformListScrollHandle,
     selected_index: usize,
     hovered_index: Option<usize>,
@@ -25,6 +35,7 @@ pub struct AcpThreadHistory {
     search_query: SharedString,
     visible_items: Vec<ListItemType>,
     local_timezone: UtcOffset,
+    confirming_delete_history: bool,
     _update_task: Task<()>,
     _subscriptions: Vec<gpui::Subscription>,
 }
@@ -32,17 +43,17 @@ pub struct AcpThreadHistory {
 enum ListItemType {
     BucketSeparator(TimeBucket),
     Entry {
-        entry: HistoryEntry,
+        entry: DbThreadMetadata,
         format: EntryTimeFormat,
     },
     SearchResult {
-        entry: HistoryEntry,
+        entry: DbThreadMetadata,
         positions: Vec<usize>,
     },
 }
 
 impl ListItemType {
-    fn history_entry(&self) -> Option<&HistoryEntry> {
+    fn history_entry(&self) -> Option<&DbThreadMetadata> {
         match self {
             ListItemType::Entry { entry, .. } => Some(entry),
             ListItemType::SearchResult { entry, .. } => Some(entry),
@@ -52,14 +63,14 @@ impl ListItemType {
 }
 
 pub enum ThreadHistoryEvent {
-    Open(HistoryEntry),
+    Open(DbThreadMetadata),
 }
 
 impl EventEmitter<ThreadHistoryEvent> for AcpThreadHistory {}
 
 impl AcpThreadHistory {
     pub(crate) fn new(
-        history_store: Entity<agent::HistoryStore>,
+        thread_store: Entity<ThreadStore>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -80,14 +91,14 @@ impl AcpThreadHistory {
                 }
             });
 
-        let history_store_subscription = cx.observe(&history_store, |this, _, cx| {
+        let thread_store_subscription = cx.observe(&thread_store, |this, _, cx| {
             this.update_visible_items(true, cx);
         });
 
         let scroll_handle = UniformListScrollHandle::default();
 
         let mut this = Self {
-            history_store,
+            thread_store,
             scroll_handle,
             selected_index: 0,
             hovered_index: None,
@@ -98,7 +109,8 @@ impl AcpThreadHistory {
             )
             .unwrap(),
             search_query: SharedString::default(),
-            _subscriptions: vec![search_editor_subscription, history_store_subscription],
+            confirming_delete_history: false,
+            _subscriptions: vec![search_editor_subscription, thread_store_subscription],
             _update_task: Task::ready(()),
         };
         this.update_visible_items(false, cx);
@@ -107,7 +119,7 @@ impl AcpThreadHistory {
 
     fn update_visible_items(&mut self, preserve_selected_item: bool, cx: &mut Context<Self>) {
         let entries = self
-            .history_store
+            .thread_store
             .update(cx, |store, _| store.entries().collect());
         let new_list_items = if self.search_query.is_empty() {
             self.add_list_separators(entries, cx)
@@ -124,13 +136,12 @@ impl AcpThreadHistory {
             let new_visible_items = new_list_items.await;
             this.update(cx, |this, cx| {
                 let new_selected_index = if let Some(history_entry) = selected_history_entry {
-                    let history_entry_id = history_entry.id();
                     new_visible_items
                         .iter()
                         .position(|visible_entry| {
                             visible_entry
                                 .history_entry()
-                                .is_some_and(|entry| entry.id() == history_entry_id)
+                                .is_some_and(|entry| entry.id == history_entry.id)
                         })
                         .unwrap_or(0)
                 } else {
@@ -145,18 +156,18 @@ impl AcpThreadHistory {
         });
     }
 
-    fn add_list_separators(&self, entries: Vec<HistoryEntry>, cx: &App) -> Task<Vec<ListItemType>> {
+    fn add_list_separators(
+        &self,
+        entries: Vec<DbThreadMetadata>,
+        cx: &App,
+    ) -> Task<Vec<ListItemType>> {
         cx.background_spawn(async move {
             let mut items = Vec::with_capacity(entries.len() + 1);
             let mut bucket = None;
             let today = Local::now().naive_local().date();
 
             for entry in entries.into_iter() {
-                let entry_date = entry
-                    .updated_at()
-                    .with_timezone(&Local)
-                    .naive_local()
-                    .date();
+                let entry_date = entry.updated_at.with_timezone(&Local).naive_local().date();
                 let entry_bucket = TimeBucket::from_dates(today, entry_date);
 
                 if Some(entry_bucket) != bucket {
@@ -175,7 +186,7 @@ impl AcpThreadHistory {
 
     fn filter_search_results(
         &self,
-        entries: Vec<HistoryEntry>,
+        entries: Vec<DbThreadMetadata>,
         cx: &App,
     ) -> Task<Vec<ListItemType>> {
         let query = self.search_query.clone();
@@ -185,7 +196,7 @@ impl AcpThreadHistory {
                 let mut candidates = Vec::with_capacity(entries.len());
 
                 for (idx, entry) in entries.iter().enumerate() {
-                    candidates.push(StringMatchCandidate::new(idx, entry.title()));
+                    candidates.push(StringMatchCandidate::new(idx, thread_title(entry)));
                 }
 
                 const MAX_MATCHES: usize = 100;
@@ -216,11 +227,11 @@ impl AcpThreadHistory {
         self.visible_items.is_empty() && !self.search_query.is_empty()
     }
 
-    fn selected_history_entry(&self) -> Option<&HistoryEntry> {
+    fn selected_history_entry(&self) -> Option<&DbThreadMetadata> {
         self.get_history_entry(self.selected_index)
     }
 
-    fn get_history_entry(&self, visible_items_ix: usize) -> Option<&HistoryEntry> {
+    fn get_history_entry(&self, visible_items_ix: usize) -> Option<&DbThreadMetadata> {
         self.visible_items.get(visible_items_ix)?.history_entry()
     }
 
@@ -320,15 +331,28 @@ impl AcpThreadHistory {
             return;
         };
 
-        let task = match entry {
-            HistoryEntry::AcpThread(thread) => self
-                .history_store
-                .update(cx, |this, cx| this.delete_thread(thread.id.clone(), cx)),
-            HistoryEntry::TextThread(text_thread) => self.history_store.update(cx, |this, cx| {
-                this.delete_text_thread(text_thread.path.clone(), cx)
-            }),
-        };
+        let task = self
+            .thread_store
+            .update(cx, |store, cx| store.delete_thread(entry.id.clone(), cx));
         task.detach_and_log_err(cx);
+    }
+
+    fn remove_history(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.thread_store.update(cx, |store, cx| {
+            store.delete_threads(cx).detach_and_log_err(cx)
+        });
+        self.confirming_delete_history = false;
+        cx.notify();
+    }
+
+    fn prompt_delete_history(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.confirming_delete_history = true;
+        cx.notify();
+    }
+
+    fn cancel_delete_history(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.confirming_delete_history = false;
+        cx.notify();
     }
 
     fn render_list_items(
@@ -373,7 +397,7 @@ impl AcpThreadHistory {
 
     fn render_history_entry(
         &self,
-        entry: &HistoryEntry,
+        entry: &DbThreadMetadata,
         format: EntryTimeFormat,
         ix: usize,
         highlight_positions: Vec<usize>,
@@ -381,8 +405,23 @@ impl AcpThreadHistory {
     ) -> AnyElement {
         let selected = ix == self.selected_index;
         let hovered = Some(ix) == self.hovered_index;
-        let timestamp = entry.updated_at().timestamp();
-        let thread_timestamp = format.format_timestamp(timestamp, self.local_timezone);
+        let timestamp = entry.updated_at.timestamp();
+
+        let display_text = match format {
+            EntryTimeFormat::DateAndTime => {
+                let entry_time = entry.updated_at;
+                let now = Utc::now();
+                let duration = now.signed_duration_since(entry_time);
+                let days = duration.num_days();
+
+                format!("{}d", days)
+            }
+            EntryTimeFormat::TimeOnly => format.format_timestamp(timestamp, self.local_timezone),
+        };
+
+        let title = thread_title(entry).clone();
+        let full_date =
+            EntryTimeFormat::DateAndTime.format_timestamp(timestamp, self.local_timezone);
 
         h_flex()
             .w_full()
@@ -398,16 +437,19 @@ impl AcpThreadHistory {
                             .gap_2()
                             .justify_between()
                             .child(
-                                HighlightedLabel::new(entry.title(), highlight_positions)
+                                HighlightedLabel::new(thread_title(entry), highlight_positions)
                                     .size(LabelSize::Small)
                                     .truncate(),
                             )
                             .child(
-                                Label::new(thread_timestamp)
+                                Label::new(display_text)
                                     .color(Color::Muted)
                                     .size(LabelSize::XSmall),
                             ),
                     )
+                    .tooltip(move |_, cx| {
+                        Tooltip::with_meta(title.clone(), None, full_date.clone(), cx)
+                    })
                     .on_hover(cx.listener(move |this, is_hovered, _window, cx| {
                         if *is_hovered {
                             this.hovered_index = Some(ix);
@@ -426,9 +468,10 @@ impl AcpThreadHistory {
                                 .tooltip(move |_window, cx| {
                                     Tooltip::for_action("Delete", &RemoveSelectedThread, cx)
                                 })
-                                .on_click(
-                                    cx.listener(move |this, _, _, cx| this.remove_thread(ix, cx)),
-                                ),
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.remove_thread(ix, cx);
+                                    cx.stop_propagation()
+                                })),
                         )
                     } else {
                         None
@@ -447,34 +490,38 @@ impl Focusable for AcpThreadHistory {
 
 impl Render for AcpThreadHistory {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let has_no_history = self.thread_store.read(cx).is_empty();
+
         v_flex()
             .key_context("ThreadHistory")
             .size_full()
+            .bg(cx.theme().colors().panel_background)
             .on_action(cx.listener(Self::select_previous))
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_first))
             .on_action(cx.listener(Self::select_last))
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::remove_selected_thread))
-            .when(!self.history_store.read(cx).is_empty(cx), |parent| {
-                parent.child(
-                    h_flex()
-                        .h(px(41.)) // Match the toolbar perfectly
-                        .w_full()
-                        .py_1()
-                        .px_2()
-                        .gap_2()
-                        .justify_between()
-                        .border_b_1()
-                        .border_color(cx.theme().colors().border)
-                        .child(
-                            Icon::new(IconName::MagnifyingGlass)
-                                .color(Color::Muted)
-                                .size(IconSize::Small),
-                        )
-                        .child(self.search_editor.clone()),
-                )
-            })
+            .on_action(cx.listener(|this, _: &RemoveHistory, window, cx| {
+                this.remove_history(window, cx);
+            }))
+            .child(
+                h_flex()
+                    .h(Tab::container_height(cx))
+                    .w_full()
+                    .py_1()
+                    .px_2()
+                    .gap_2()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border)
+                    .child(
+                        Icon::new(IconName::MagnifyingGlass)
+                            .color(Color::Muted)
+                            .size(IconSize::Small),
+                    )
+                    .child(self.search_editor.clone()),
+            )
             .child({
                 let view = v_flex()
                     .id("list-container")
@@ -482,20 +529,16 @@ impl Render for AcpThreadHistory {
                     .overflow_hidden()
                     .flex_grow();
 
-                if self.history_store.read(cx).is_empty(cx) {
-                    view.justify_center()
-                        .child(
-                            h_flex().w_full().justify_center().child(
-                                Label::new("You don't have any past threads yet.")
-                                    .size(LabelSize::Small),
-                            ),
-                        )
-                } else if self.search_produced_no_matches() {
-                    view.justify_center().child(
-                        h_flex().w_full().justify_center().child(
-                            Label::new("No threads match your search.").size(LabelSize::Small),
-                        ),
+                if has_no_history {
+                    view.justify_center().items_center().child(
+                        Label::new("You don't have any past threads yet.")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
                     )
+                } else if self.search_produced_no_matches() {
+                    view.justify_center()
+                        .items_center()
+                        .child(Label::new("No threads match your search.").size(LabelSize::Small))
                 } else {
                     view.child(
                         uniform_list(
@@ -507,22 +550,80 @@ impl Render for AcpThreadHistory {
                         )
                         .p_1()
                         .pr_4()
-                        .track_scroll(self.scroll_handle.clone())
+                        .track_scroll(&self.scroll_handle)
                         .flex_grow(),
                     )
-                    .vertical_scrollbar_for(
-                        self.scroll_handle.clone(),
-                        window,
-                        cx,
-                    )
+                    .vertical_scrollbar_for(&self.scroll_handle, window, cx)
                 }
+            })
+            .when(!has_no_history, |this| {
+                this.child(
+                    h_flex()
+                        .p_2()
+                        .border_t_1()
+                        .border_color(cx.theme().colors().border_variant)
+                        .when(!self.confirming_delete_history, |this| {
+                            this.child(
+                                Button::new("delete_history", "Delete All History")
+                                    .full_width()
+                                    .style(ButtonStyle::Outlined)
+                                    .label_size(LabelSize::Small)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.prompt_delete_history(window, cx);
+                                    })),
+                            )
+                        })
+                        .when(self.confirming_delete_history, |this| {
+                            this.w_full()
+                                .gap_2()
+                                .flex_wrap()
+                                .justify_between()
+                                .child(
+                                    h_flex()
+                                        .flex_wrap()
+                                        .gap_1()
+                                        .child(
+                                            Label::new("Delete all threads?")
+                                                .size(LabelSize::Small),
+                                        )
+                                        .child(
+                                            Label::new("You won't be able to recover them later.")
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .gap_1()
+                                        .child(
+                                            Button::new("cancel_delete", "Cancel")
+                                                .label_size(LabelSize::Small)
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.cancel_delete_history(window, cx);
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("confirm_delete", "Delete")
+                                                .style(ButtonStyle::Tinted(ui::TintColor::Error))
+                                                .color(Color::Error)
+                                                .label_size(LabelSize::Small)
+                                                .on_click(cx.listener(|_, _, window, cx| {
+                                                    window.dispatch_action(
+                                                        Box::new(RemoveHistory),
+                                                        cx,
+                                                    );
+                                                })),
+                                        ),
+                                )
+                        }),
+                )
             })
     }
 }
 
 #[derive(IntoElement)]
 pub struct AcpHistoryEntryElement {
-    entry: HistoryEntry,
+    entry: DbThreadMetadata,
     thread_view: WeakEntity<AcpThreadView>,
     selected: bool,
     hovered: bool,
@@ -530,7 +631,7 @@ pub struct AcpHistoryEntryElement {
 }
 
 impl AcpHistoryEntryElement {
-    pub fn new(entry: HistoryEntry, thread_view: WeakEntity<AcpThreadView>) -> Self {
+    pub fn new(entry: DbThreadMetadata, thread_view: WeakEntity<AcpThreadView>) -> Self {
         Self {
             entry,
             thread_view,
@@ -553,9 +654,9 @@ impl AcpHistoryEntryElement {
 
 impl RenderOnce for AcpHistoryEntryElement {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let id = self.entry.id();
-        let title = self.entry.title();
-        let timestamp = self.entry.updated_at();
+        let id = ElementId::Name(self.entry.id.0.clone().into());
+        let title = thread_title(&self.entry).clone();
+        let timestamp = self.entry.updated_at;
 
         let formatted_time = {
             let now = chrono::Utc::now();
@@ -623,31 +724,10 @@ impl RenderOnce for AcpHistoryEntryElement {
                         .upgrade()
                         .and_then(|view| view.read(cx).workspace().upgrade())
                     {
-                        match &entry {
-                            HistoryEntry::AcpThread(thread_metadata) => {
-                                if let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
-                                    panel.update(cx, |panel, cx| {
-                                        panel.load_agent_thread(
-                                            thread_metadata.clone(),
-                                            window,
-                                            cx,
-                                        );
-                                    });
-                                }
-                            }
-                            HistoryEntry::TextThread(text_thread) => {
-                                if let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
-                                    panel.update(cx, |panel, cx| {
-                                        panel
-                                            .open_saved_text_thread(
-                                                text_thread.path.clone(),
-                                                window,
-                                                cx,
-                                            )
-                                            .detach_and_log_err(cx);
-                                    });
-                                }
-                            }
+                        if let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
+                            panel.update(cx, |panel, cx| {
+                                panel.load_agent_thread(entry.clone(), window, cx);
+                            });
                         }
                     }
                 }
@@ -672,7 +752,7 @@ impl EntryTimeFormat {
                 timezone,
                 time_format::TimestampFormat::EnhancedAbsolute,
             ),
-            EntryTimeFormat::TimeOnly => time_format::format_time(timestamp),
+            EntryTimeFormat::TimeOnly => time_format::format_time(timestamp.to_offset(timezone)),
         }
     }
 }

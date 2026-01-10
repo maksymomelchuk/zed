@@ -561,7 +561,7 @@ impl project::ProjectItem for NotebookItem {
         if path.path.extension().unwrap_or_default() == "ipynb" {
             Some(cx.spawn(async move |cx| {
                 let abs_path = project
-                    .read_with(cx, |project, cx| project.absolute_path(&path, cx))?
+                    .read_with(cx, |project, cx| project.absolute_path(&path, cx))
                     .with_context(|| format!("finding the absolute path of {path:?}"))?;
 
                 // todo: watch for changes to the file
@@ -586,16 +586,16 @@ impl project::ProjectItem for NotebookItem {
                 let id = project
                     .update(cx, |project, cx| {
                         project.entry_for_path(&path, cx).map(|entry| entry.id)
-                    })?
+                    })
                     .context("Entry not found")?;
 
-                cx.new(|_| NotebookItem {
+                Ok(cx.new(|_| NotebookItem {
                     path: abs_path,
                     project_path: path,
                     languages,
                     notebook,
                     id,
-                })
+                }))
             }))
         } else {
             None
@@ -694,6 +694,10 @@ impl EventEmitter<()> for NotebookEditor {}
 impl Item for NotebookEditor {
     type Event = ();
 
+    fn can_split(&self) -> bool {
+        true
+    }
+
     fn clone_on_split(
         &self,
         _workspace_id: Option<workspace::WorkspaceId>,
@@ -752,7 +756,7 @@ impl Item for NotebookEditor {
     }
 
     // TODO
-    fn as_searchable(&self, _: &Entity<Self>) -> Option<Box<dyn SearchableItemHandle>> {
+    fn as_searchable(&self, _: &Entity<Self>, _: &App) -> Option<Box<dyn SearchableItemHandle>> {
         None
     }
 
